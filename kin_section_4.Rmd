@@ -1,0 +1,216 @@
+---
+title: "Priority Targets KIN Section 4"
+author: "Ryan Thomas"
+date: "2024-02-02"
+output: powerpoint_presentation
+---
+
+# Load libraries
+```{r setup, include=FALSE}
+library(tidyverse)
+library(disR)
+library(googlesheets4)
+library(googledrive)
+```
+
+
+```{r cell formats}
+# create the various number formats we will need
+# each is a list of class googlesheets4_schema_CellData to work with the api
+percent_cell_format  <- number_format(type = "PERCENT", pattern = "#0%")
+currency_cell_format <- number_format(type = "CURRENCY", sprintf('%s#,##0', "$"))
+number_cell_format   <- number_format(type = "NUMBER", '#,##0')
+parity_cell_format   <- number_format(type = "CURRENCY", sprintf('%s#,##0.00', "$"))
+wrap_cell_format     <- text_format(strategy = "WRAP", valign = "TOP")
+```
+
+
+# Make data directory
+To replicate the process with existing data, rename the "data" folder with the date that the data was exported from DIS.
+
+For each new data pull, download data into the `data` folder. This has to be done manually using the DIS "OU Activity Indicator Results Report". First, create a new "data" folder with the following code chunk.
+```{r}
+if(!dir.exists("data")) dir.create("data")
+```
+
+# Run manual exports
+In DIS, navigate to the "OU Activity Indicator Results Report". Select the following parameters:
+- Fiscal year: 2023, 2024, 2025
+- Collection Period: All
+- Collection Frequency: "Annual"
+- Reporting organization: USAID
+- Indicator Origin: "FTF"
+- Indicator: EG.3.1-15, EG.3.2-25, EG.3.2-26, EG.3.2-27
+- Hide disaggregates?: "No"
+- All others can remain as the default "(All)"
+
+Then, 
+- Operating Unit: _select one at a time_
+
+Export to Excel. 
+
+# Manuall rename files on download
+Rename the file to give to the name of the corresponding OU in the `remote_folders$name` from the code chunk below, all of the characters before the first underscore. This file name will be used to join/ merge the files after. That "join" was done manually the first time, and I recommend continuing to make sure that is done manually. We want to make sure that the file "folder_crosswalk" aligns the folder and googlesheets4 ID with the corresponding local fie.
+
+Get the name of the the remote folders in MEL TA review folder. Note that this is not necessary for repeated data pulls each year. Each coming year, the folders will be new and these links will need to be updated.
+```{r}
+link <- "https://drive.google.com/drive/folders/1xWMqjMhD9znCxu8bR5vv3q1740Ebkvia"
+remote_folders <- drive_ls(link, q = "name contains 'FY23 MEL TA review files'") %>%
+  arrange(name) %>%
+  mutate(common_name = sub("^(.*?)_FY23 MEL TA review files", "\\1",name), .after = name)
+```
+
+# Data processing ######
+```{r Data processing - get a list of the local files}
+# create a vector of file names
+# local_files <- tibble(common_name = str_split(list.files("data"), " - ", simplify = TRUE)[,1]
+#                       , files = list.files("data", full.names = TRUE))
+# manually do the crosswalk 
+# write.csv(remote_folders[, -3], "remote_folders.csv") # remove the third column that is not used and causes an error.
+# write.csv(local_files, "local_files.csv")
+```
+
+Once these are written as CSVs, open them both and manually copy-paste the file paths into the remote_folders. Save the new file as "folder_crosswalk.csv".
+```{r read crosswalk}
+fc <- read_csv("folder_crosswalk.csv")
+fc <- filter(fc, !is.na(file)) # remove any rows that do not have a corresponding file.
+```
+
+## Read in data template 
+The readme and a template summary sheet are already manually written and saved on Google Drive.
+```{r Read in data template}
+# Get the readme from the template
+readme   <- read_sheet("1iLMFfmUIa9It5Mvq8MVJTRKgZqpgJS4bz3wsqIrNrmQ"
+                       , sheet = "ReadMe")
+# Get the template of the priority targets and years. This will be used in a join later.
+template <- read_sheet("1iLMFfmUIa9It5Mvq8MVJTRKgZqpgJS4bz3wsqIrNrmQ"
+                       , sheet = "Template") %>% 
+  mutate(`Fiscal Year` = as.character(`Fiscal Year`))
+```
+
+## Function to read individual files
+Create a function to use in the map to read files and prep them to the same format.
+```{r Function to read individual files}
+# make a function to read the exported files.
+read_kin <- function(x) {
+  readxl::read_excel(x) %>%
+    mutate(across(c(Target, Actual), ~ parse_double(gsub("[%USD,$ -]", "", .)))) 
+}
+
+# dat <- read_kin("data/Bureau for Resilience and Food Security - OU Activity Indicator Results Report - Export All.xlsx")
+```
+
+# Prepare to upload data
+Define a function that will be used in a purrr::pmap function with three variables: name, id, and file. The three variables are:
+- name: the name of the MEL TA Review folder to which we will upload the worksheet
+- id: the googlesheets4 ID of the Mel TA Review Folder
+- file: the path to the raw data for the corresponding DIS export
+```{r Prepare to upload raw data}
+# Debug for errors
+ix <- 36
+name <- fc$name[ix]
+id <- fc$id[ix]
+file <- fc$file[ix]
+
+upload_raw <- function(.x, ss, sheet) {
+
+  sheet_write(.x, ss = ss, sheet = sheet)
+  
+  range_flood(ss = ss
+              , sheet = sheet
+              , range = "A:I"
+              , cell = wrap_cell_format)
+  
+  range_flood(ss = ss
+              , sheet = sheet
+              , range = "E:F"
+              , cell = number_cell_format)
+}
+```
+
+# Function to upload data
+```{r Prepare to upload summary and raw data}
+upload_all <- function(name, id, file) {
+  
+  # use the pt ("priority target") function defined in the kin_section_4.R file
+  # to take take the DIS export and create the summary tab
+  data <- read_kin(file) %>% priority_targets()
+  
+  if(!is.null(data[[1]])) {
+    # tab names have a 100 character limit, reduce the name to 50 characters
+  name <- str_sub(name, 1, 50)
+  
+  # the name of the new worksheet that will be located in the folder
+  new_name <- paste0(str_split(name, "_", simplify = T)[1]
+                     , " KIN Section 4 Review")
+
+  # Now create a new sheet in your My Drive
+  new_sheet <- gs4_create(name = new_name) # save the output so we can use the new ID
+  # move the new sheet (defaults to your myDrive)
+  move_sheet <- drive_mv(
+    file = as_id(new_sheet) # original sheet location -- save the output to use in the next line
+    , name = new_name # give it the name you made above
+    , path = as_id(id) # move it to this path -- the ID supplied from the mel ta folder
+    , overwrite = TRUE) 
+  # update the ss value programmatically.
+  ssid <- as_id(move_sheet)
+  
+  # add the readme sheet
+  sheet_write(readme, ss = ssid
+              , sheet = "ReadMe")
+  # Take a moment to reformat the README sheet
+  range_flood(ss = ssid
+              , sheet = "ReadMe", range = "A:C"
+              , cell = wrap_cell_format)
+  
+  # remove the default Sheet1
+  sheet_delete(ss = ssid, sheet = "Sheet1")
+  
+  # The pt function returns a list of 2 tibbles
+  # The first tibble is the summary sheet.
+  upload <- sheet_write(data[[1]], ss = ssid
+                        , sheet = "Section 4 Summary")
+  # Take a moment to reformat the summary sheet values as curreny, numbers, or percent.
+  range_flood(ss = ssid
+              , sheet = "Section 4 Summary", range = "E2:F4"
+              , cell = currency_cell_format)
+  range_flood(ss = ssid
+              , sheet = "Section 4 Summary", range = "E5:F7"
+              , cell = parity_cell_format)
+  range_flood(ss = ssid
+              , sheet = "Section 4 Summary", range = "E8:F10"
+              , cell = number_cell_format)
+  range_flood(ss = ssid
+              , sheet = "Section 4 Summary", range = "E11:F13"
+              , cell = currency_cell_format)
+  range_flood(ss = ssid
+              , sheet = "Section 4 Summary", range = "G:G"
+              , cell = percent_cell_format)
+
+  # The second element in the list output from the pt function is a list (within a list)
+  # that has a separate tibble for each activity. 
+  # Iterate over the second element to upload individual sheets
+  pmap(list(.x = data[[2]][["data"]]
+            , ss = ssid
+            , sheet = str_sub(data[[2]][["activity"]], 1, 50))
+       , .f = upload_raw)
+
+  } else {
+    
+    warning(paste0(name, "has length 0. Proceeding to next file.\n"))
+  
+    }
+  
+}
+
+```
+
+# Upload the worksheets and tabs
+The following one liner runs the previous two code chunks 
+```{r}
+# out <- pmap(list(name = fc$name, id = fc$id, file = fc$file), .f = upload_all) 
+# Save it to the value out so it will not create a bunch of output.
+```
+
+
+
